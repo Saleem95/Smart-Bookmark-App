@@ -8,183 +8,95 @@ type Bookmark = {
   id: string;
   title: string;
   url: string;
-  user_id: string;
   created_at: string;
 };
 
 export default function Dashboard() {
   const router = useRouter();
-
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
   const [title, setTitle] = useState("");
   const [url, setUrl] = useState("");
-  const [userId, setUserId] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
 
-  // 🔐 Check session + initialize
   useEffect(() => {
-    const init = async () => {
-      const { data } = await supabase.auth.getSession();
-
-      if (!data.session) {
-        router.replace("/");
-        return;
-      }
-
-      const uid = data.session.user.id;
-      setUserId(uid);
-      setLoading(false);
-
-      fetchBookmarks(uid);
-      subscribeToRealtime(uid);
-    };
-
-    init();
-
-    // 🔄 Auto redirect on logout
-    const { data: listener } = supabase.auth.onAuthStateChange(
-      (event) => {
-        if (event === "SIGNED_OUT") {
-          router.replace("/");
-        }
-      }
-    );
-
-    return () => {
-      listener.subscription.unsubscribe();
-    };
+    checkUser();
   }, []);
 
-  // 📥 Initial Fetch
-  const fetchBookmarks = async (uid: string) => {
+  const checkUser = async () => {
+    const { data } = await supabase.auth.getSession();
+    if (!data.session) {
+      router.push("/");
+    } else {
+      fetchBookmarks();
+      subscribeToRealtime();
+    }
+  };
+
+  const fetchBookmarks = async () => {
     const { data } = await supabase
       .from("bookmarks")
       .select("*")
-      .eq("user_id", uid)
       .order("created_at", { ascending: false });
 
     setBookmarks(data || []);
   };
 
-  // 🔄 Realtime (no refetch, direct state updates)
-  const subscribeToRealtime = (uid: string) => {
+  const subscribeToRealtime = () => {
     supabase
-      .channel("bookmarks-channel")
+      .channel("bookmarks-realtime")
       .on(
         "postgres_changes",
-        {
-          event: "INSERT",
-          schema: "public",
-          table: "bookmarks",
-          filter: `user_id=eq.${uid}`,
-        },
-        (payload) => {
-          setBookmarks((prev) => [payload.new as Bookmark, ...prev]);
-        }
-      )
-      .on(
-        "postgres_changes",
-        {
-          event: "DELETE",
-          schema: "public",
-          table: "bookmarks",
-          filter: `user_id=eq.${uid}`,
-        },
-        (payload) => {
-          setBookmarks((prev) =>
-            prev.filter((b) => b.id !== payload.old.id)
-          );
+        { event: "*", schema: "public", table: "bookmarks" },
+        () => {
+          fetchBookmarks();
         }
       )
       .subscribe();
   };
 
-  // ➕ Add Bookmark (Optimistic)
   const addBookmark = async () => {
-    if (!title || !url || !userId) return;
+    if (!title || !url) return;
 
-    const tempId = crypto.randomUUID();
+    const { data } = await supabase.auth.getUser();
 
-    const optimisticBookmark: Bookmark = {
-      id: tempId,
+    await supabase.from("bookmarks").insert({
       title,
       url,
-      user_id: userId,
-      created_at: new Date().toISOString(),
-    };
-
-    // Optimistic UI
-    setBookmarks((prev) => [optimisticBookmark, ...prev]);
-
-    const { data, error } = await supabase
-      .from("bookmarks")
-      .insert({
-        title,
-        url,
-        user_id: userId,
-      })
-      .select()
-      .single();
-
-    if (error) {
-      // Rollback if failed
-      setBookmarks((prev) => prev.filter((b) => b.id !== tempId));
-      console.error(error.message);
-      return;
-    }
-
-    // Replace temp bookmark with real one
-    setBookmarks((prev) =>
-      prev.map((b) => (b.id === tempId ? data : b))
-    );
+      user_id: data.user?.id,
+    });
 
     setTitle("");
     setUrl("");
   };
 
-  // ❌ Delete Bookmark (Optimistic)
   const deleteBookmark = async (id: string) => {
-    const previous = bookmarks;
-
-    // Remove instantly
+    await supabase.from("bookmarks").delete().eq("id", id);
     setBookmarks((prev) => prev.filter((b) => b.id !== id));
-
-    const { error } = await supabase
-      .from("bookmarks")
-      .delete()
-      .eq("id", id);
-
-    if (error) {
-      // Rollback if failed
-      setBookmarks(previous);
-      console.error(error.message);
-    }
   };
 
-  // 🚪 Logout
-  const handleLogout = async () => {
-    await supabase.auth.signOut();
-    router.replace("/");
-    router.refresh();
+  // ✅ FIXED DATE FORMAT (no hydration issue)
+  const formatDate = (date: string) => {
+    return new Date(date).toISOString().split("T")[0];
   };
 
-  if (loading) {
-    return <div className="p-10">Loading...</div>;
-  }
+  const formatTime = (date: string) => {
+    return new Date(date).toISOString().split("T")[1].slice(0, 8);
+  };
 
   return (
-    <div className="min-h-screen bg-gray-100 p-10">
-      <div className="flex justify-between items-center mb-6">
+    <div className="min-h-screen bg-blue-950 p-10">
+      <div className="flex justify-between mb-6">
         <h1 className="text-2xl font-bold">My Bookmarks</h1>
         <button
-          onClick={handleLogout}
-          className="bg-red-500 text-white px-4 py-2 rounded hover:bg-red-600"
+          onClick={async () => {
+            await supabase.auth.signOut();
+            router.push("/");
+          }}
+          className="bg-red-500 text-white px-4 py-2 rounded"
         >
           Logout
         </button>
       </div>
 
-      {/* Add Bookmark */}
       <div className="flex gap-3 mb-6">
         <input
           placeholder="Title"
@@ -200,36 +112,57 @@ export default function Dashboard() {
         />
         <button
           onClick={addBookmark}
-          className="bg-black text-white px-4 rounded hover:bg-gray-800"
+          className="bg-black text-white px-4 rounded"
         >
           Add
         </button>
       </div>
 
-      {/* Bookmark List */}
-      <ul className="space-y-3">
-        {bookmarks.map((bookmark) => (
-          <li
-            key={bookmark.id}
-            className="bg-white p-4 rounded shadow flex justify-between"
-          >
-            <a
-              href={bookmark.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-blue-600 hover:underline"
-            >
-              {bookmark.title}
-            </a>
-            <button
-              onClick={() => deleteBookmark(bookmark.id)}
-              className="text-red-500 hover:text-red-700"
-            >
-              Delete
-            </button>
-          </li>
-        ))}
-      </ul>
+      <div className=" rounded shadow">
+        <table className="w-full text-left">
+          <thead className="">
+            <tr>
+              <th className="p-3">SL No</th>
+              <th className="p-3">Title</th>
+              <th className="p-3">URL</th>
+              <th className="p-3">Date</th>
+              <th className="p-3">Time</th>
+              <th className="p-3">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {bookmarks.map((bookmark, index) => (
+              <tr key={bookmark.id} className="border-t">
+                <td className="p-3">{index + 1}</td>
+                <td className="p-3">{bookmark.title}</td>
+                <td className="p-3">
+                  <a
+                    href={bookmark.url}
+                    target="_blank"
+                    className="text-blue-600 underline"
+                  >
+                    Visit
+                  </a>
+                </td>
+                <td className="p-3">
+                  {formatDate(bookmark.created_at)}
+                </td>
+                <td className="p-3">
+                  {formatTime(bookmark.created_at)}
+                </td>
+                <td className="p-3">
+                  <button
+                    onClick={() => deleteBookmark(bookmark.id)}
+                    className="text-red-500"
+                  >
+                    Delete
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
