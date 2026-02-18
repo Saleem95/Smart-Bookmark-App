@@ -18,87 +18,154 @@ export default function Dashboard() {
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
   const [title, setTitle] = useState("");
   const [url, setUrl] = useState("");
-  const [loading, setLoading] = useState(true);
   const [userId, setUserId] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
 
-  // 🔐 Check session on mount
+  // 🔐 Check session + initialize
   useEffect(() => {
     const init = async () => {
       const { data } = await supabase.auth.getSession();
 
       if (!data.session) {
-        router.push("/");
+        router.replace("/");
         return;
       }
 
-      setUserId(data.session.user.id);
+      const uid = data.session.user.id;
+      setUserId(uid);
       setLoading(false);
-      fetchBookmarks(data.session.user.id);
-      subscribeToRealtime(data.session.user.id);
+
+      fetchBookmarks(uid);
+      subscribeToRealtime(uid);
     };
 
     init();
+
+    // 🔄 Auto redirect on logout
+    const { data: listener } = supabase.auth.onAuthStateChange(
+      (event) => {
+        if (event === "SIGNED_OUT") {
+          router.replace("/");
+        }
+      }
+    );
+
+    return () => {
+      listener.subscription.unsubscribe();
+    };
   }, []);
 
-  // 📥 Fetch user bookmarks
+  // 📥 Initial Fetch
   const fetchBookmarks = async (uid: string) => {
-    const { data, error } = await supabase
+    const { data } = await supabase
       .from("bookmarks")
       .select("*")
       .eq("user_id", uid)
       .order("created_at", { ascending: false });
 
-    if (!error) {
-      setBookmarks(data || []);
-    }
+    setBookmarks(data || []);
   };
 
-  // 🔄 Realtime subscription (filtered by user)
+  // 🔄 Realtime (no refetch, direct state updates)
   const subscribeToRealtime = (uid: string) => {
-    const channel = supabase
+    supabase
       .channel("bookmarks-channel")
       .on(
         "postgres_changes",
         {
-          event: "*",
+          event: "INSERT",
           schema: "public",
           table: "bookmarks",
           filter: `user_id=eq.${uid}`,
         },
-        () => {
-          fetchBookmarks(uid);
+        (payload) => {
+          setBookmarks((prev) => [payload.new as Bookmark, ...prev]);
+        }
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "DELETE",
+          schema: "public",
+          table: "bookmarks",
+          filter: `user_id=eq.${uid}`,
+        },
+        (payload) => {
+          setBookmarks((prev) =>
+            prev.filter((b) => b.id !== payload.old.id)
+          );
         }
       )
       .subscribe();
-
-    return () => {
-      supabase.removeChannel(channel);
-    };
   };
 
-  // ➕ Add bookmark
+  // ➕ Add Bookmark (Optimistic)
   const addBookmark = async () => {
     if (!title || !url || !userId) return;
 
-    await supabase.from("bookmarks").insert({
+    const tempId = crypto.randomUUID();
+
+    const optimisticBookmark: Bookmark = {
+      id: tempId,
       title,
       url,
       user_id: userId,
-    });
+      created_at: new Date().toISOString(),
+    };
+
+    // Optimistic UI
+    setBookmarks((prev) => [optimisticBookmark, ...prev]);
+
+    const { data, error } = await supabase
+      .from("bookmarks")
+      .insert({
+        title,
+        url,
+        user_id: userId,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      // Rollback if failed
+      setBookmarks((prev) => prev.filter((b) => b.id !== tempId));
+      console.error(error.message);
+      return;
+    }
+
+    // Replace temp bookmark with real one
+    setBookmarks((prev) =>
+      prev.map((b) => (b.id === tempId ? data : b))
+    );
 
     setTitle("");
     setUrl("");
   };
 
-  // ❌ Delete bookmark
+  // ❌ Delete Bookmark (Optimistic)
   const deleteBookmark = async (id: string) => {
-    await supabase.from("bookmarks").delete().eq("id", id);
+    const previous = bookmarks;
+
+    // Remove instantly
+    setBookmarks((prev) => prev.filter((b) => b.id !== id));
+
+    const { error } = await supabase
+      .from("bookmarks")
+      .delete()
+      .eq("id", id);
+
+    if (error) {
+      // Rollback if failed
+      setBookmarks(previous);
+      console.error(error.message);
+    }
   };
 
   // 🚪 Logout
   const handleLogout = async () => {
     await supabase.auth.signOut();
-    router.push("/");
+    router.replace("/");
+    router.refresh();
   };
 
   if (loading) {
@@ -106,7 +173,7 @@ export default function Dashboard() {
   }
 
   return (
-    <div className="min-h-screen bg-blue-950 p-10">
+    <div className="min-h-screen bg-gray-100 p-10">
       <div className="flex justify-between items-center mb-6">
         <h1 className="text-2xl font-bold">My Bookmarks</h1>
         <button
